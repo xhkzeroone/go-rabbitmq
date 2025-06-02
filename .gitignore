@@ -1,0 +1,29 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace
+bin/
+vendor/
+*.log
+
+# Go module files (optional)
+# Uncomment the next lines if you don’t want to commit go.sum or go.mod
+# go.sum
+# go.mod
+
+# IDEs
+.idea/
+*.iml
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
