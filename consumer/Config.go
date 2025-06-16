@@ -1,58 +1,38 @@
 package consumer
 
 import (
-	"github.com/spf13/viper"
-	"strings"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"time"
 )
 
+// === Configuration ===
+
 type Config struct {
-	URL               string            `yaml:"url" mapstructure:"url"`
-	UseTLS            bool              `yaml:"useTLS" mapstructure:"useTLS"`
-	ClientCert        string            `yaml:"clientCert" mapstructure:"clientCert"`
-	ClientKey         string            `yaml:"clientKey" mapstructure:"clientKey"`
-	CACert            string            `yaml:"caCert" mapstructure:"caCert"`
-	Queues            map[string]string `yaml:"queues" mapstructure:"queues"`
-	ConsumerTag       string            `yaml:"consumerTag" mapstructure:"consumerTag"`
-	ReconnectInterval time.Duration     `yaml:"reconnectInterval" mapstructure:"reconnectInterval"`
-	Heartbeat         time.Duration     `yaml:"heartbeat" mapstructure:"heartbeat"`
-	PrefetchCount     int               `yaml:"prefetchCount" mapstructure:"prefetchCount"`
-	RetryCount        int               `yaml:"retryCount" mapstructure:"retryCount"`
-	RequeueOnFail     bool              `yaml:"requeueOnFail" mapstructure:"requeueOnFail"`
+	RabbitMQ RabbitMQConfig `yaml:"rabbitmq" mapstructure:"rabbitmq" json:"rabbitmq"`
 }
 
-// DefaultConfig returns a Config struct with default values.
-// It reads from environment variables (with underscores replacing dots),
-// or falls back to hardcoded defaults if env vars are not set.
-func DefaultConfig() *Config {
-	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	viper.AutomaticEnv()
+type RabbitMQConfig struct {
+	URL            string                 `yaml:"url" mapstructure:"url" json:"url"`
+	TLS            bool                   `yaml:"tls" mapstructure:"tls" json:"tls"`
+	ClientCert     string                 `yaml:"clientCert" mapstructure:"clientCert" json:"clientCert"`
+	ClientKey      string                 `yaml:"clientKey" mapstructure:"clientKey" json:"clientKey"`
+	CACert         string                 `yaml:"caCert" mapstructure:"caCert" json:"caCert"`
+	Heartbeat      time.Duration          `yaml:"heartbeat" mapstructure:"heartbeat" json:"heartbeat"`
+	ReconnectDelay time.Duration          `yaml:"reconnectDelay" mapstructure:"reconnectDelay" json:"reconnectDelay"`
+	Prefetch       int                    `yaml:"prefetch" mapstructure:"prefetch" json:"prefetch"`
+	Queues         map[string]QueueConfig `yaml:"queues" mapstructure:"queues" json:"queues"`
+}
 
-	viper.SetDefault("url", "amqp://guest:guest@localhost:5672/")
-	viper.SetDefault("useTLS", false)
-	viper.SetDefault("clientCert", "")
-	viper.SetDefault("clientKey", "")
-	viper.SetDefault("caCert", "")
-	viper.SetDefault("queues", map[string]string{"default": "defaultQueue"})
-	viper.SetDefault("consumerTag", "myConsumer")
-	viper.SetDefault("reconnectInterval", 5*time.Second)
-	viper.SetDefault("heartbeat", 10*time.Second)
-	viper.SetDefault("prefetchCount", 1)
-	viper.SetDefault("retryCount", 3)
-	viper.SetDefault("requeueOnFail", true)
-
-	return &Config{
-		URL:               viper.GetString("url"),
-		UseTLS:            viper.GetBool("useTLS"),
-		ClientCert:        viper.GetString("clientCert"),
-		ClientKey:         viper.GetString("clientKey"),
-		CACert:            viper.GetString("caCert"),
-		Queues:            viper.GetStringMapString("queues"),
-		ConsumerTag:       viper.GetString("consumerTag"),
-		ReconnectInterval: viper.GetDuration("reconnectInterval"),
-		Heartbeat:         viper.GetDuration("heartbeat"),
-		PrefetchCount:     viper.GetInt("prefetchCount"),
-		RetryCount:        viper.GetInt("retryCount"),
-		RequeueOnFail:     viper.GetBool("requeueOnFail"),
-	}
+type QueueConfig struct {
+	Queue         string     `yaml:"queue" mapstructure:"queue" json:"queue"`
+	BindingKey    string     `yaml:"bindingKey" mapstructure:"bindingKey" json:"bindingKey"`
+	Exchange      string     `yaml:"exchange" mapstructure:"exchange" json:"exchange"`
+	ConsumerTag   string     `yaml:"consumerTag" mapstructure:"consumerTag" json:"consumerTag"`
+	AutoAck       bool       `yaml:"autoAck" mapstructure:"autoAck" json:"autoAck"`
+	Durable       bool       `yaml:"durable" mapstructure:"durable" json:"durable"`
+	AutoDelete    bool       `yaml:"autoDelete" mapstructure:"autoDelete" json:"autoDelete"`
+	Passive       bool       `yaml:"passive" mapstructure:"passive" json:"passive"`
+	Prefetch      int        `yaml:"prefetch" mapstructure:"prefetch" json:"prefetch"`
+	Arguments     amqp.Table `yaml:"arguments" mapstructure:"arguments" json:"arguments"`
+	RequeueOnFail bool       `yaml:"requeueOnFail" mapstructure:"requeueOnFail" json:"requeueOnFail"`
 }

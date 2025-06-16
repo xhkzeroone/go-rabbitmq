@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"github.com/spf13/viper"
 	"github.com/xhkzeroone/go-rabbitmq/consumer"
 	"log"
@@ -9,24 +10,59 @@ import (
 	"syscall"
 )
 
+type LogHandler struct{}
+
+func (LogHandler) Handle(b []byte) ([]byte, error) {
+	log.Printf(string(b))
+	return nil, nil
+}
+
+type Log2Handler struct{}
+
+func (Log2Handler) Handle(b []byte) ([]byte, error) {
+	log.Printf(string(b))
+	return nil, nil
+}
+
 func main() {
-	cfg, err := loadConfig()
-	if err != nil {
-		log.Fatalf("❌ Load config failed: %v", err)
+	cfg := consumer.Config{
+		RabbitMQ: consumer.RabbitMQConfig{
+			URL:      "amqp://guest:guest@localhost:5672/",
+			Prefetch: 10,
+			Queues: map[string]consumer.QueueConfig{
+				"loghandler": { // <= tên struct (lowercase)
+					Queue:    "log-queue",
+					Exchange: "logs",
+					Durable:  true,
+				},
+				"log2handler": { // <= tên struct (lowercase)
+					Queue:    "log2-queue",
+					Exchange: "logs",
+					Durable:  true,
+				},
+				"emailhandler": { // <= tên struct (lowercase)
+					Queue:    "email-queue",
+					Exchange: "email",
+					Durable:  true,
+				},
+				"onboardhandler": { // <= tên struct (lowercase)
+					Queue:    "onboard-queue",
+					Exchange: "onboard",
+					Durable:  true,
+				},
+			},
+		},
 	}
 
-	consumer, err := consumer.NewWithRetry(cfg)
-	if err != nil {
-		log.Fatalf("❌ Init consumer failed: %v", err)
+	mgr := consumer.New(&cfg)
+	mgr.Register(&LogHandler{}, &Log2Handler{}, &EmailHandler{}, &OnboardHandler{}) // hoặc nhiều handler cùng lúc
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := mgr.Listen(ctx); err != nil {
+		log.Fatal(err)
 	}
-
-	consumer.Register(&EmailHandler{}, &OnboardHandler{})
-
-	if err := consumer.Listen(); err != nil {
-		log.Fatalf("❌ Listen failed: %v", err)
-	}
-
-	waitForShutdown(consumer)
 }
 
 type EmailHandler struct{}
@@ -59,10 +95,10 @@ func loadConfig() (*consumer.Config, error) {
 	return &cfg, nil
 }
 
-func waitForShutdown(c *consumer.Consumer) {
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-	log.Println("🛑 Shutting down...")
-	c.Close()
-}
+//func waitForShutdown(c *consumer.Manager) {
+//	sig := make(chan os.Signal, 1)
+//	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+//	<-sig
+//	log.Println("🛑 Shutting down...")
+//	c.Close()
+//}

@@ -1,275 +1,280 @@
 package consumer
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"log"
+	"math"
 	"os"
-	"reflect"
-	"strings"
+	"sync"
 	"time"
 )
 
-// Consumer represents a RabbitMQ consumer with connection, channel, configuration,
-// and a set of registered handlers to process messages.
+// === Consumer & Manager ===
+
+// Consumer represents a logical subscription.
+// All fields except Handler come from QueueConfig.
 type Consumer struct {
-	conn    *amqp.Connection       // AMQP connection
-	channel *amqp.Channel          // AMQP channel
-	config  *Config                // Consumer configuration
-	handler map[string]HandlerFunc // Map of queue key to message handler function
+	cfg     QueueConfig
+	name    string
+	ch      *amqp.Channel
+	handler HandlerFunc
 }
 
-// NewWithRetry attempts to establish a connection to RabbitMQ with retry logic.
-//
-// It repeatedly tries to connect using the provided configuration until successful.
-//
-// Parameters:
-//   - cfg: configuration for RabbitMQ connection and consumer settings.
-//
-// Returns:
-//   - a connected Consumer instance if successful,
-//   - or an error if connection fails repeatedly.
-func NewWithRetry(cfg *Config) (*Consumer, error) {
-	var (
-		c   *Consumer
-		err error
-	)
+// RabbitManager owns a single connection and N consumer channels.
+type RabbitManager struct {
+	cfg         *Config
+	conn        *amqp.Connection
+	lock        sync.RWMutex
+	handlers    map[string]HandlerFunc
+	consumers   []*Consumer
+	notifyClose chan *amqp.Error
+	ctx         context.Context
+	cancel      context.CancelFunc
+}
 
-	for {
-		c, err = New(cfg)
-		if err == nil {
-			log.Println("[RabbitMQ] Connected successfully.")
-			return c, nil
-		}
-
-		log.Printf("[RabbitMQ] Connection failed: %v — retrying in %v", err, cfg.ReconnectInterval)
-		time.Sleep(cfg.ReconnectInterval)
+// New builds manager with config (URL may be overridden later).
+func New(cfg *Config) *RabbitManager {
+	return &RabbitManager{
+		cfg:      cfg,
+		handlers: make(map[string]HandlerFunc),
 	}
 }
 
-// New creates a new Consumer by establishing a RabbitMQ connection and channel.
-//
-// Parameters:
-//   - cfg: configuration including URL, TLS settings, heartbeat, prefetch count.
-//
-// Returns:
-//   - a Consumer instance ready for use,
-//   - or an error if connection or channel creation fails.
-func New(cfg *Config) (*Consumer, error) {
+// Register registers one or more struct handlers. The struct name (lowercase)
+// must match key in cfg.RabbitMQ.Queues.
+func (m *RabbitManager) Register(h ...Handler) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	for _, hd := range h {
+		name := getStructName(hd)
+		m.handlers[name] = hd.Handle
+		log.Printf("[RabbitMQ] registered handler for %s", name)
+	}
+}
+
+// Listen establishes connection, creates consumers and blocks until ctx done.
+func (m *RabbitManager) Listen(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.ctx, m.cancel = context.WithCancel(ctx)
+
+	// Build consumer list from cfg & registered handlers.
+	for key, qc := range m.cfg.RabbitMQ.Queues {
+		h, ok := m.handlers[key]
+		if !ok {
+			log.Printf("[RabbitMQ] No handler registered for %s – skip", key)
+			continue
+		}
+		c := &Consumer{cfg: qc, name: key, handler: h}
+		m.consumers = append(m.consumers, c)
+	}
+
+	if len(m.consumers) == 0 {
+		return errors.New("no consumers to start")
+	}
+
+	// Keep reconnecting until context cancelled.
+	backoff := m.cfg.RabbitMQ.ReconnectDelay
+	if backoff == 0 {
+		backoff = 5 * time.Second
+	}
+
+	for {
+		if err := m.connectOnce(); err != nil {
+			log.Printf("[RabbitMQ] connect error: %v", err)
+		} else {
+			// wait for connection close or ctx cancel
+			select {
+			case <-m.ctx.Done():
+				m.closeConn()
+				return nil
+			case err := <-m.notifyClose:
+				if err != nil {
+					log.Printf("[RabbitMQ] connection closed: %v", err)
+				}
+			}
+		}
+		// exponential backoff w/ cap 1m
+		select {
+		case <-time.After(backoff):
+		case <-m.ctx.Done():
+			return nil
+		}
+		backoff = time.Duration(math.Min(float64(backoff*2), float64(time.Minute)))
+	}
+}
+
+// Stop cancels internal context (graceful shutdown).
+func (m *RabbitManager) Stop() {
+	if m.cancel != nil {
+		m.cancel()
+	}
+}
+
+// connectOnce dials and starts all consumers.
+func (m *RabbitManager) connectOnce() error {
 	var conn *amqp.Connection
 	var err error
 
-	amqpConfig := amqp.Config{
-		Heartbeat: cfg.Heartbeat,
-		Locale:    "en_US",
-	}
-
-	if cfg.UseTLS {
-		tlsConfig, err := loadTLSConfig(cfg)
-		if err != nil {
-			return nil, err
+	url := m.cfg.RabbitMQ.URL
+	if m.cfg.RabbitMQ.TLS {
+		tlsCfg, errTLS := loadTLSConfig(&m.cfg.RabbitMQ)
+		if errTLS != nil {
+			return errTLS
 		}
-		amqpConfig.TLSClientConfig = tlsConfig
+		conn, err = amqp.DialTLS(url, tlsCfg)
+	} else {
+		conn, err = amqp.Dial(url)
 	}
-
-	conn, err = amqp.DialConfig(cfg.URL, amqpConfig)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	ch, err := conn.Channel()
-	if err != nil {
-		return nil, err
-	}
+	m.lock.Lock()
+	m.conn = conn
+	m.notifyClose = conn.NotifyClose(make(chan *amqp.Error, 1))
+	m.lock.Unlock()
 
-	if cfg.PrefetchCount > 0 {
-		if err := ch.Qos(cfg.PrefetchCount, 0, false); err != nil {
-			return nil, err
+	// open channel & start each consumer
+	for _, c := range m.consumers {
+		if err = m.initConsumer(c); err != nil {
+			m.closeConn()
+			return err
 		}
 	}
-
-	return &Consumer{
-		conn:    conn,
-		channel: ch,
-		config:  cfg,
-		handler: make(map[string]HandlerFunc),
-	}, nil
+	log.Printf("[RabbitMQ] connection established (%d consumers)", len(m.consumers))
+	return nil
 }
 
-// Register registers message handlers for queues based on handler struct names.
-//
-// Parameters:
-//   - h: one or more handlers implementing the Handler interface.
-//     Each handler is registered using its struct name (converted to lowercase) as the key.
-//
-// For example, a handler struct named "Task" will be registered for the queue key "task".
-func (c *Consumer) Register(h ...Handler) {
-	for _, v := range h {
-		c.handler[getStructName(v)] = v.Handle
+func (m *RabbitManager) closeConn() {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	if m.conn != nil {
+		_ = m.conn.Close()
+		m.conn = nil
 	}
 }
 
-// Listen starts consuming messages from all queues configured.
-//
-// It declares each queue, verifies a registered handler exists, and spawns a goroutine
-// to consume messages for each queue.
-//
-// Returns:
-//   - an error if any queue declaration fails.
-func (c *Consumer) Listen() error {
-	for key, queueName := range c.config.Queues {
-		_, err := c.channel.QueueDeclare(
-			queueName, true, false, false, false, nil,
-		)
-		if err != nil {
-			log.Printf("[RabbitMQ] Failed to declare queue %s: %v", queueName, err)
-			continue
+func (m *RabbitManager) initConsumer(c *Consumer) error {
+	ch, err := m.conn.Channel()
+	if err != nil {
+		return err
+	}
+	// prefetch
+	prefetch := c.cfg.Prefetch
+	if prefetch == 0 {
+		prefetch = m.cfg.RabbitMQ.Prefetch
+	}
+	if prefetch > 0 {
+		if err = ch.Qos(prefetch, 0, false); err != nil {
+			return err
 		}
+	}
+	// declare topology or verify only
+	if err = declareTopology(ch, &c.cfg); err != nil {
+		return err
+	}
 
-		handler, exists := c.handler[key]
-		if !exists {
-			log.Printf("[RabbitMQ] No handler registered for queue: %s", queueName)
-			continue
+	c.ch = ch
+	go c.consumeLoop(m.ctx)
+	return nil
+}
+
+// === Consumer implementation ===
+
+func declareTopology(ch *amqp.Channel, q *QueueConfig) error {
+	if q.Passive {
+		_, err := ch.QueueDeclarePassive(q.Queue, q.Durable, q.AutoDelete, false, false, q.Arguments)
+		return err
+	}
+	// declare exchange if provided
+	if q.Exchange != "" {
+		exType := "direct"
+		if q.BindingKey == "" {
+			exType = "fanout"
 		}
-
-		go c.listenQueue(queueName, handler)
+		if err := ch.ExchangeDeclare(q.Exchange, exType, q.Durable, q.AutoDelete, false, false, nil); err != nil {
+			return err
+		}
+	}
+	_, err := ch.QueueDeclare(q.Queue, q.Durable, q.AutoDelete, false, false, q.Arguments)
+	if err != nil {
+		return err
+	}
+	if q.Exchange != "" {
+		if err = ch.QueueBind(q.Queue, q.BindingKey, q.Exchange, false, nil); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// Close closes the RabbitMQ channel and connection.
-//
-// Should be called when the consumer is no longer needed.
-func (c *Consumer) Close() {
-	_ = c.channel.Close()
-	_ = c.conn.Close()
-}
-
-// --- Private helper functions ---
-
-// getStructName returns the lowercase struct name of the provided interface,
-// dereferencing pointer types if necessary.
-func getStructName(i interface{}) string {
-	t := reflect.TypeOf(i)
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
+func (c *Consumer) consumeLoop(ctx context.Context) {
+	msgs, err := c.ch.Consume(c.cfg.Queue, c.cfg.ConsumerTag, c.cfg.AutoAck, false, false, false, nil)
+	if err != nil {
+		log.Printf("[%s] consume error: %v", c.name, err)
+		return
 	}
-	return strings.ToLower(t.Name())
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case m, ok := <-msgs:
+			if !ok {
+				return
+			}
+			c.handleDelivery(&m)
+		}
+	}
 }
 
-// loadTLSConfig loads TLS configuration from certificate files specified in Config.
-//
-// Parameters:
-//   - cfg: configuration containing paths to client cert, client key, and CA cert files.
-//
-// Returns:
-//   - a *tls.Config if the certificates are loaded successfully,
-//   - or an error otherwise.
-func loadTLSConfig(cfg *Config) (*tls.Config, error) {
+func (c *Consumer) handleDelivery(m *amqp.Delivery) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[%s] panic: %v", c.name, r)
+			_ = m.Nack(false, c.cfg.RequeueOnFail)
+		}
+	}()
+	resp, err := c.handler(m.Body)
+	if err != nil {
+		log.Printf("[%s] handler error: %v", c.name, err)
+		_ = m.Nack(false, c.cfg.RequeueOnFail)
+		return
+	}
+	// reply if needed
+	if m.ReplyTo != "" && resp != nil {
+		if publishErr := c.ch.PublishWithContext(context.TODO(), "", m.ReplyTo, false, false, amqp.Publishing{
+			CorrelationId: m.CorrelationId,
+			ContentType:   "application/json",
+			Body:          resp,
+		}); publishErr != nil {
+			log.Printf("[%s] reply publish error: %v", c.name, publishErr)
+			_ = m.Nack(false, true)
+			return
+		}
+	}
+	if !c.cfg.AutoAck {
+		_ = m.Ack(false)
+	}
+}
+
+// === TLS helper ===
+
+func loadTLSConfig(cfg *RabbitMQConfig) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(cfg.ClientCert, cfg.ClientKey)
 	if err != nil {
 		return nil, err
 	}
-
-	caCert, err := os.ReadFile(cfg.CACert)
+	caPem, err := os.ReadFile(cfg.CACert)
 	if err != nil {
 		return nil, err
 	}
-	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      caCertPool,
-		MinVersion:   tls.VersionTLS12,
-	}, nil
-}
-
-// listenQueue continuously consumes messages from the specified queue and processes them using the handler.
-//
-// Parameters:
-//   - queueName: the name of the queue to consume from.
-//   - handler: a function that processes message bodies and returns a response and an error.
-func (c *Consumer) listenQueue(queueName string, handler HandlerFunc) {
-	for {
-		msgs, err := c.channel.Consume(
-			queueName,
-			c.config.ConsumerTag,
-			false,
-			false, false, false,
-			nil,
-		)
-		if err != nil {
-			log.Printf("[RabbitMQ] Failed to consume from queue %s: %v — reconnecting...", queueName, err)
-			c.reconnect()
-			continue
-		}
-
-		log.Printf("[RabbitMQ] Listening on queue: %s", queueName)
-
-		for msg := range msgs {
-			go func(m amqp.Delivery) {
-				var err error
-				var resp []byte
-
-				for attempt := 1; attempt <= c.config.RetryCount; attempt++ {
-					resp, err = handler(m.Body)
-					if err == nil {
-						break
-					}
-					log.Printf("[RabbitMQ] Handler error (attempt %d/%d): %v", attempt, c.config.RetryCount, err)
-					time.Sleep(300 * time.Millisecond)
-				}
-
-				if m.ReplyTo != "" {
-					err2 := c.channel.Publish(
-						"", m.ReplyTo, false, false,
-						amqp.Publishing{
-							ContentType:   "application/json",
-							CorrelationId: m.CorrelationId,
-							Body:          resp,
-						},
-					)
-					if err2 != nil {
-						log.Printf("[RabbitMQ] Failed to send reply to %s: %v", m.ReplyTo, err2)
-					}
-				}
-
-				if err != nil {
-					log.Printf("[RabbitMQ] Message processing failed, sending NACK")
-					_ = m.Nack(false, c.config.RequeueOnFail)
-				} else {
-					_ = m.Ack(false)
-				}
-			}(msg)
-		}
-
-		log.Printf("[RabbitMQ] Consumer channel closed for queue %s — retrying consumption", queueName)
-		time.Sleep(c.config.ReconnectInterval)
-	}
-}
-
-// reconnect attempts to re-establish the RabbitMQ connection and channel.
-//
-// It loops until a successful reconnection is made.
-func (c *Consumer) reconnect() {
-	for {
-		newConsumer, err := New(c.config)
-		if err != nil {
-			log.Printf("[RabbitMQ] Reconnect failed: %v — retrying in %v", err, c.config.ReconnectInterval)
-			time.Sleep(c.config.ReconnectInterval)
-			continue
-		}
-
-		c.conn = newConsumer.conn
-		c.channel = newConsumer.channel
-
-		if c.config.PrefetchCount > 0 {
-			_ = c.channel.Qos(c.config.PrefetchCount, 0, false)
-		}
-
-		log.Println("[RabbitMQ] Reconnected successfully.")
-		break
-	}
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caPem)
+	return &tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool, MinVersion: tls.VersionTLS12}, nil
 }

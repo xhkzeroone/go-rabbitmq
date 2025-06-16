@@ -1,10 +1,6 @@
-url: "amqp://guest:guest@localhost:5672/"
-consumerTag: ""
-heartbeat: 10s
-reconnectInterval: 5s
-prefetchCount: 10
-retryCount: 3
-requeueOnFail: true
-queues:
-  EmailHandler: xhkzeroone.EmailHandler
-  OnboardHandler: xhkzeroone.OnboardHandler
+rabbitmq:
+  url: "amqp://guest:guest@localhost:5672/"
+  heartbeat: 10s
+  queues:
+    EmailHandler:
+      queue: xhkzeroone.EmailHandler
