@@ -2,103 +2,129 @@ package main
 
 import (
 	"context"
-	"github.com/spf13/viper"
-	"github.com/xhkzeroone/go-rabbitmq/consumer"
-	"log"
+	"flag"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
+
+	"github.com/spf13/viper"
+	"github.com/xhkzeroone/go-rabbitmq/consumer"
 )
+
+/* -------------------------------------------------------------------------- */
+/* 📨  BUSINESS HANDLERS – tách file riêng nếu muốn                            */
+/* -------------------------------------------------------------------------- */
 
 type LogHandler struct{}
 
 func (LogHandler) Handle(b []byte) ([]byte, error) {
-	log.Printf(string(b))
+	slog.Info("LogHandler", "msg", string(b))
 	return nil, nil
 }
 
 type Log2Handler struct{}
 
 func (Log2Handler) Handle(b []byte) ([]byte, error) {
-	log.Printf(string(b))
+	slog.Info("Log2Handler", "msg", string(b))
 	return nil, nil
-}
-
-func main() {
-	cfg := consumer.Config{
-		RabbitMQ: consumer.RabbitMQConfig{
-			URL:      "amqp://guest:guest@localhost:5672/",
-			Prefetch: 10,
-			Queues: map[string]consumer.QueueConfig{
-				"loghandler": { // <= tên struct (lowercase)
-					Queue:    "log-queue",
-					Exchange: "logs",
-					Durable:  true,
-				},
-				"log2handler": { // <= tên struct (lowercase)
-					Queue:    "log2-queue",
-					Exchange: "logs",
-					Durable:  true,
-				},
-				"emailhandler": { // <= tên struct (lowercase)
-					Queue:    "email-queue",
-					Exchange: "email",
-					Durable:  true,
-				},
-				"onboardhandler": { // <= tên struct (lowercase)
-					Queue:    "onboard-queue",
-					Exchange: "onboard",
-					Durable:  true,
-				},
-			},
-		},
-	}
-
-	mgr := consumer.New(&cfg)
-	mgr.Register(&LogHandler{}, &Log2Handler{}, &EmailHandler{}, &OnboardHandler{}) // hoặc nhiều handler cùng lúc
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	if err := mgr.Listen(ctx); err != nil {
-		log.Fatal(err)
-	}
 }
 
 type EmailHandler struct{}
 
-func (h *EmailHandler) Handle(msg []byte) ([]byte, error) {
-	log.Printf("📨 [EmailHandler] Received: %s", string(msg))
+func (EmailHandler) Handle(b []byte) ([]byte, error) {
+	slog.Info("EmailHandler", "msg", string(b))
 	return []byte(`{"status":"ok"}`), nil
 }
 
 type OnboardHandler struct{}
 
-func (h *OnboardHandler) Handle(msg []byte) ([]byte, error) {
-	log.Printf("📨 [OnboardHandler] Received: %s", string(msg))
+func (OnboardHandler) Handle(b []byte) ([]byte, error) {
+	slog.Info("OnboardHandler", "msg", string(b))
 	return []byte(`{"status":"ok"}`), nil
 }
 
-func loadConfig() (*consumer.Config, error) {
-	viper.SetConfigName("config")
-	viper.SetConfigType("yaml")
-	viper.AddConfigPath(".")
+/* -------------------------------------------------------------------------- */
+/* 🚀  ENTRYPOINT                                                             */
+/* -------------------------------------------------------------------------- */
 
-	if err := viper.ReadInConfig(); err != nil {
-		return nil, err
+func main() {
+	// --config=./config.yaml (mặc định ./config.yaml)
+	cfgPath := flag.String("config", "config.yaml", "path to config file")
+	flag.Parse()
+
+	// thiết lập slog (mặc định JSON, thêm timestamp, level,…)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
+	// đọc YAML vào consumer.Config
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		slog.Error("load config failed", "err", err)
+		os.Exit(1)
 	}
 
-	var cfg consumer.Config
-	if err := viper.Unmarshal(&cfg); err != nil {
-		return nil, err
+	// khởi tạo Manager & đăng ký handler
+	mgr := consumer.New(cfg)
+	mgr.Register(
+		&LogHandler{},
+		&Log2Handler{},
+		&EmailHandler{},
+		&OnboardHandler{},
+	)
+
+	// Context huỷ khi nhận SIGINT/SIGTERM
+	ctx, stop := signal.NotifyContext(context.Background(),
+		os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// chạy lắng nghe
+	if err := mgr.Listen(ctx); err != nil {
+		slog.Error("manager stopped with error", "err", err)
 	}
-	return &cfg, nil
+	slog.Info("👋 graceful shutdown complete")
 }
 
-//func waitForShutdown(c *consumer.Manager) {
-//	sig := make(chan os.Signal, 1)
-//	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-//	<-sig
-//	log.Println("🛑 Shutting down...")
-//	c.Close()
-//}
+/* -------------------------------------------------------------------------- */
+/* 🔧  loadConfig – đọc YAML bằng Viper                                        */
+/* -------------------------------------------------------------------------- */
+
+func loadConfig(path string) (*consumer.Config, error) {
+	viper.SetConfigFile(path)
+	viper.SetConfigType("yaml")
+
+	// Thời gian đọc & parse có timeout nhẹ để tránh treo khởi động
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	type result struct {
+		cfg *consumer.Config
+		err error
+	}
+	done := make(chan result, 1)
+
+	go func() {
+		var r result
+		if err := viper.ReadInConfig(); err != nil {
+			r.err = err
+		} else {
+			var cfg consumer.Config
+			if err := viper.Unmarshal(&cfg); err != nil {
+				r.err = err
+			} else {
+				r.cfg = &cfg
+			}
+		}
+		done <- r
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-done:
+		return r.cfg, r.err
+	}
+}

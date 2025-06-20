@@ -1,3 +1,33 @@
+// Package consumer cung cấp các tiện ích (RabbitManager, Consumer, ...) để
+// xây dựng hệ thống tiêu thụ RabbitMQ có khả năng tự động reconnect cả
+// connection và channel.
+//
+// Triết lý thiết kế:
+//
+//  1. *RabbitManager* duy trì **một** kết nối (*amqp.Connection*) và chia sẻ
+//     kết nối này cho nhiều *Consumer* dưới dạng các kênh AMQP độc lập.
+//  2. Mỗi *Consumer* **tự giám sát** kênh của chính mình (NotifyClose) và chủ
+//     động mở lại kênh khi bị đóng, KHÔNG cần tác động tới connection.
+//  3. *RabbitManager* giám sát connection gốc và tự động khôi phục lại khi
+//     kết nối bị mất; việc reconnect được thực hiện với chiến lược back‑off
+//     có jitter để tránh bão reconnect.
+//  4. Toàn bộ mã nguồn được bình luận chi tiết bằng tiếng Việt và tuân thủ
+//     quy tắc "Go doc":
+//     • Mọi tên xuất (exported) đều có chú thích bắt đầu bằng chính tên đó.
+//     • Tên private quan trọng cũng có chú thích ngắn gọn khi cần.
+//
+// Cách sử dụng tối thiểu:
+//
+//	mgr := consumer.New(cfg)
+//	mgr.Register(&MyLogHandler{})
+//	ctx := context.Background()
+//	if err := mgr.Listen(ctx); err != nil { ... }
+//
+// Trong đó *MyLogHandler* cần triển khai interface *Handler* với phương thức
+// Handle([]byte) ([]byte, error).
+//
+// Lưu ý: File này KHÔNG chứa định nghĩa của *QueueConfig*, *Config* ... – chúng
+// được khai báo ở một module khác (phần placeholder bên dưới chỉ để minh hoạ).
 package consumer
 
 import (
@@ -5,6 +35,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+
 	amqp "github.com/rabbitmq/amqp091-go"
 	"log"
 	"math/rand"
@@ -13,29 +44,74 @@ import (
 	"time"
 )
 
-// ======================= Phần Định nghĩa Consumer & Manager =======================
+/*  --------------------------------------------------------------------------
+    🐇  RABBIT MANAGER V2 – TỰ ĐỘNG RECONNECT CONNECTION + CHANNEL
+    --------------------------------------------------------------------------
+    Khác biệt chính so với V1:
+      1. Mỗi Consumer **tự giám sát channel riêng** và tự mở lại (re‑open)
+         khi channel bị đóng, KHÔNG cần đóng/mở lại connection.
+      2. RabbitManager vẫn chịu trách nhiệm giám sát **connection gốc**
+         và tự động reconnect khi connection bị drop.
+      3. Dùng RWMutex để **chia sẻ an toàn** connection cho nhiều Consumer.
+*/
 
-// Consumer đại diện cho một subscription logic tới hàng đợi (queue) cụ thể.
-// Mỗi Consumer tương ứng đúng 1 queue hoặc 1 cặp exchange/queue/binding.
-//
-// ➡️  Field giải thích:
-//   - cfg     : Cấu hình hàng đợi được đọc từ file cấu hình bên ngoài.
-//   - name    : Tên ngắn gọn của consumer (thường trùng với key trong file config).
-//   - ch      : Channel AMQP dành riêng cho consumer này (mỗi consumer 1 channel).
-//   - handler : Hàm xử lý message, được inject thông qua phương thức Register().
-//
-// Lý do KHÔNG lưu ctx vào Consumer: Context chung được cấp từ RabbitManager,
-// và Consumer chỉ đọc <-ctx.Done() bên trong consumeLoop.
-// Tách riêng tránh circular reference & đơn giản hoá unit‑test.
-type Consumer struct {
-	cfg     QueueConfig
-	name    string
-	ch      *amqp.Channel
-	handler HandlerFunc
-}
+// ============================================================================
+// 👉 Các kiểu dữ liệu placeholder (đã định nghĩa ở module khác)
+// ============================================================================
+/*
+   Những kiểu dưới đây chỉ để trình biên dịch biết; hãy thay thế bằng bản gốc
+   trong dự án thực tế.
+*/
 
-// RabbitManager sở hữu một kết nối (connection) duy nhất tới RabbitMQ
-// và quản lý N channel (mỗi channel gắn với một Consumer).
+// type QueueConfig struct {
+// 	Queue, Exchange, BindingKey, ConsumerTag string
+// 	Durable, AutoDelete, Passive, AutoAck    bool
+// 	Prefetch                                 int
+// 	RequeueOnFail                            bool
+// 	Arguments                                amqp.Table
+// }
+//
+// type Config struct {
+// 	RabbitMQ RabbitMQConfig
+// }
+//
+// type RabbitMQConfig struct {
+// 	URL            string
+// 	TLS            bool
+// 	ReconnectDelay time.Duration
+// 	Prefetch       int
+// 	ClientCert     string
+// 	ClientKey      string
+// 	CACert         string
+// 	Queues         map[string]QueueConfig
+// }
+//
+// type HandlerFunc func([]byte) ([]byte, error)
+
+// Handler định nghĩa interface tối thiểu mà ứng dụng cần implement để xử lý
+// message nhận được.
+//
+// Hàm Handle nhận *payload* dưới dạng []byte, trả về []byte (có thể nil) làm
+// response RPC cùng error (nếu có).
+//
+// Comment này dùng làm ví dụ cho builder *go doc* – trong dự án thật, Handler
+// thường đã được định nghĩa ở package khác.
+//
+//go:generate mockgen -destination=mocks_test.go -package=consumer . Handler
+// (ghi chú go:generate chỉ minh hoạ)
+// type Handler interface{ Handle([]byte) ([]byte, error) }
+
+// getStructName trả về tên kiểu cụ thể (không bao gồm package) của một giá trị
+// triển khai interface Handler. Hàm này thường được định nghĩa ở package utils.
+// func getStructName(h Handler) string { return "" /* placeholder */ }
+
+// ============================================================================
+// 🌐 STRUCT RabbitManager – quản trị **connection** chia sẻ cho nhiều Consumer
+// ============================================================================
+
+// RabbitManager giữ một kết nối duy nhất tới RabbitMQ và phân phát kết nối đó
+// cho nhiều Consumer dưới dạng các channel. Nó giám sát connection gốc và tự
+// động reconnect khi connection bị đóng.
 //
 //	╭──────────────╮           ╭──────────────╮
 //	│ RabbitManager│──────────▶│  Connection  │ 1 connection, share TCP socket
@@ -45,21 +121,29 @@ type Consumer struct {
 //	       ├── channel (Consumer B)  │ multiple AMQP channels (multiplexed)
 //	       └── …                     │
 //
-// Việc dùng 1 connection giúp tiết kiệm tài nguyên (TCP, TLS handshake).
-// Khi connection bị drop, Manager sẽ tự reconnect & khởi tạo lại toàn bộ channel.
+// Zero value của *RabbitManager* KHÔNG hợp lệ; hãy dùng hàm New để khởi tạo.
+// Sau khi tạo, người dùng cần:
+//  1. gọi (*RabbitManager).Register(...) để đăng ký các Handler;
+//  2. gọi (*RabbitManager).Listen(ctx) để bắt đầu lắng nghe.
+//
+// Khi không còn nhu cầu, hãy gọi (*RabbitManager).Stop() để dừng toàn bộ goroutine.
 type RabbitManager struct {
-	cfg         *Config                // Cấu hình gốc (chứa thông tin RabbitMQ & toàn app)
-	conn        *amqp.Connection       // Kết nối thực tới broker
-	lock        sync.RWMutex           // Bảo vệ conn + map handler khỏi race‑condition
-	handlers    map[string]HandlerFunc // Map tên → hàm xử lý đăng ký bởi Register()
-	consumers   []*Consumer            // Danh sách consumer đã build từ config
-	notifyClose chan *amqp.Error       // Channel nhận tín hiệu đóng kết nối của AMQP driver
-	ctx         context.Context        // Context gốc được truyền khi Listen()
-	cancel      context.CancelFunc     // Hàm huỷ context, dùng cho Stop()
+	cfg *Config
+
+	// tài nguyên AMQP
+	conn *amqp.Connection
+	lock sync.RWMutex // bảo vệ conn khi truy cập đồng thời
+
+	handlers  map[string]HandlerFunc // map tên struct → handler
+	consumers []*Consumer            // danh sách Consumer đã khởi tạo
+
+	ctx    context.Context // context gốc (huỷ để stop)
+	cancel context.CancelFunc
 }
 
-// New khởi tạo RabbitManager với cấu hình ban đầu.
-// (URL có thể được override ở runtime nếu cần.)
+// New tạo mới một RabbitManager với cấu hình cfg nhưng CHƯA mở kết nối tới
+// RabbitMQ. Hàm trả về con trỏ quản lý – việc kết nối sẽ được thực hiện trong
+// phương thức Listen.
 func New(cfg *Config) *RabbitManager {
 	return &RabbitManager{
 		cfg:      cfg,
@@ -67,113 +151,113 @@ func New(cfg *Config) *RabbitManager {
 	}
 }
 
-// ======================= Đăng ký handler =======================
-
-// Register nhận 1..N struct implement giao diện Handler.
-// Tên struct (viết thường) phải khớp key cấu hình để ánh xạ đúng queue.
+// Register đăng ký một hoặc nhiều Handler. Mỗi Handler được ánh xạ bởi tên
+// struct cụ thể (lấy thông qua getStructName). Nếu trùng tên, Handler sau sẽ
+// ghi đè Handler trước.
 func (m *RabbitManager) Register(h ...Handler) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 	for _, hd := range h {
-		name := getStructName(hd)
-		m.handlers[name] = hd.Handle
-		log.Printf("[RabbitMQ] registered handler for %s", name)
+		n := getStructName(hd)
+		m.handlers[n] = hd.Handle
 	}
 }
 
-// ======================= Vòng đời chính: Listen & Stop =======================
-
-// Listen thiết lập kết nối, khởi tạo consumer và block tới khi ctx bị cancel.
-// Tự động reconnect với backoff lũy tiến.
+// Listen khởi tạo các Consumer (theo cấu hình QueueConfig) và chạy vòng lặp
+// giám sát connection. Phương thức BLOCKS tới khi:
+//   - Context bị huỷ (ctx.Done())
+//   - hoặc có lỗi nghiêm trọng xảy ra khi khởi tạo Consumer.
 func (m *RabbitManager) Listen(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	m.ctx, m.cancel = context.WithCancel(ctx)
 
-	// 1️⃣ Build danh sách consumer từ file cấu hình & các handler đã đăng ký.
-	for key, qc := range m.cfg.RabbitMQ.Queues {
-		h, ok := m.handlers[key]
-		if !ok {
-			log.Printf("[RabbitMQ] No handler registered for %s – skip", key)
-			continue
-		}
-		c := &Consumer{cfg: qc, name: key, handler: h}
-		m.consumers = append(m.consumers, c)
+	// 1) Thử kết nối một lần ngay đầu
+	if err := m.connect(); err != nil {
+		log.Printf("[RabbitMQ] initial dial failed: %v (will retry in loop)", err)
 	}
 
+	// 2) Tạo & chạy consumer SAU khi (đã hoặc sẽ) có connection
+	for key, qc := range m.cfg.RabbitMQ.Queues {
+		hd, ok := m.handlers[key]
+		if !ok { // không có handler tương ứng
+			continue
+		}
+		c := &Consumer{cfg: qc, name: key, handler: hd}
+		// gán conn hiện tại (có thể nil); sau này connectionLoop sẽ update
+		c.setConn(m.conn)
+		m.consumers = append(m.consumers, c)
+		go c.run(m.ctx) // mỗi consumer tự giám sát channel
+	}
 	if len(m.consumers) == 0 {
 		return errors.New("no consumers to start")
 	}
 
-	return m.reconnectLoop()
+	// 3) Tiếp tục vòng lặp reconnect như cũ
+	return m.connectionLoop()
 }
 
-func (m *RabbitManager) reconnectLoop() error {
-	// 2️⃣ Tính backoff (time.Sleep) khi reconnect, mặc định 5s.
-	baseBackoff := m.cfg.RabbitMQ.ReconnectDelay
-	if baseBackoff == 0 {
-		baseBackoff = 5 * time.Second
+// ---------------------------------------------------------------------------
+// connectionLoop – tự động Dial + NotifyClose + back‑off
+// ---------------------------------------------------------------------------
+//
+// Hàm BLOKING: chạy tới khi ctx.Done().
+func (m *RabbitManager) connectionLoop() error {
+	backoff := m.cfg.RabbitMQ.ReconnectDelay
+	if backoff == 0 {
+		backoff = 5 * time.Second
 	}
-	maxBackoff := time.Minute
-	backoff := baseBackoff
+	max := time.Minute
 
-	// 3️⃣ Vòng lặp chính: connect → wait → reconnect nếu lỗi.
 	for {
-		// Chờ đến khi connection đóng hoặc context hủy.
-		if err := m.connectOnce(); err != nil {
-			log.Printf("[RabbitMQ] connect error: %v", err)
+		// thử kết nối
+		if err := m.connect(); err != nil {
+			log.Printf("[RabbitMQ] dial error: %v", err)
 		} else {
+			log.Printf("[RabbitMQ] connection established (%d consumers)", len(m.consumers))
+			// chờ tới khi có sự cố
+			connClosed := make(chan *amqp.Error, 1)
+			m.conn.NotifyClose(connClosed)
 			select {
-			case <-m.ctx.Done():
+			case <-m.ctx.Done(): // ứng dụng dừng
 				m.closeConn()
 				return nil
-			case err := <-m.notifyClose:
-				if err != nil {
-					log.Printf("[RabbitMQ] connection closed: %v", err)
-				}
+			case err := <-connClosed: // connection bị drop
+				log.Printf("[RabbitMQ] connection closed: %v", err)
 			}
 		}
 
+		// exponential back‑off
 		jitter := time.Duration(rand.Int63n(int64(backoff)))
 		delay := backoff + jitter/2
-
-		// Exponential backoff, tối đa 1 phút.
 		select {
 		case <-time.After(delay):
 		case <-m.ctx.Done():
 			return nil
 		}
-
-		if backoff < maxBackoff {
+		if backoff < max {
 			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
+			if backoff > max {
+				backoff = max
 			}
 		}
 	}
 }
 
-// Stop huỷ context nội bộ → các consumer & Listen() sẽ kết thúc gracefully.
-func (m *RabbitManager) Stop() {
-	if m.cancel != nil {
-		m.cancel()
-	}
-}
-
-// ======================= Thiết lập 1 lần kết nối & channel =======================
-
-// connectOnce dial tới RabbitMQ (TLS hoặc TCP), khởi tạo tất cả consumer.
-// Nếu lỗi ở bất kỳ bước nào → đóng connection & trả lỗi để Listen() reconnect.
-func (m *RabbitManager) connectOnce() error {
-	var conn *amqp.Connection
-	var err error
-
+// ---------------------------------------------------------------------------
+// connect – dial RabbitMQ, cập nhật connection cho các Consumer
+// ---------------------------------------------------------------------------
+func (m *RabbitManager) connect() error {
+	var (
+		conn *amqp.Connection
+		err  error
+	)
 	url := m.cfg.RabbitMQ.URL
 	if m.cfg.RabbitMQ.TLS {
-		tlsCfg, errTLS := loadTLSConfig(&m.cfg.RabbitMQ)
-		if errTLS != nil {
-			return errTLS
+		tlsCfg, tlsErr := loadTLSConfig(&m.cfg.RabbitMQ)
+		if tlsErr != nil {
+			return tlsErr
 		}
 		conn, err = amqp.DialTLS(url, tlsCfg)
 	} else {
@@ -183,24 +267,19 @@ func (m *RabbitManager) connectOnce() error {
 		return err
 	}
 
-	// Lưu connection & notifyClose (phải dưới lock để thread‑safe)
+	// lưu connection
 	m.lock.Lock()
 	m.conn = conn
-	m.notifyClose = conn.NotifyClose(make(chan *amqp.Error, 1))
 	m.lock.Unlock()
 
-	// Mở riêng 1 channel cho từng consumer
+	// cập nhật connection cho tất cả Consumer (channel sẽ tự mở)
 	for _, c := range m.consumers {
-		if err = m.initConsumer(c); err != nil {
-			m.closeConn() // Đóng connection nếu init thất bại
-			return err
-		}
+		c.setConn(conn)
 	}
-	log.Printf("[RabbitMQ] connection established (%d consumers)", len(m.consumers))
 	return nil
 }
 
-// closeConn đóng connection an toàn (idempotent).
+// closeConn đóng connection hiện tại nếu đang mở.
 func (m *RabbitManager) closeConn() {
 	m.lock.Lock()
 	defer m.lock.Unlock()
@@ -210,90 +289,180 @@ func (m *RabbitManager) closeConn() {
 	}
 }
 
-// initConsumer mở channel, thiết lập QoS, khai báo topology (queue, exchange).
-func (m *RabbitManager) initConsumer(c *Consumer) error {
-	ch, err := m.conn.Channel()
+// Stop huỷ context gốc, từ đó kết thúc mọi goroutine được sinh ra bởi
+// RabbitManager và Consumer.
+func (m *RabbitManager) Stop() {
+	if m.cancel != nil {
+		m.cancel()
+	}
+}
+
+// ============================================================================
+// 🧩 STRUCT Consumer – 1 consumer tương ứng 1 queue + handler
+// ============================================================================
+
+// Consumer đại diện cho một worker tiêu thụ một hàng đợi cụ thể. Mỗi Consumer
+// có channel AMQP riêng (multiplexed trong cùng connection) và tự động khôi
+// phục channel khi gặp sự cố. Việc khởi tạo Consumer được thực hiện bởi
+// RabbitManager.
+type Consumer struct {
+	// cấu hình hàng đợi
+	cfg     QueueConfig
+	name    string      // tên (khóa) của consumer – thường khớp với struct handler
+	handler HandlerFunc // hàm xử lý message
+
+	// tài nguyên AMQP
+	ch     *amqp.Channel    // channel hiện tại
+	notify chan *amqp.Error // nhận tín hiệu NotifyClose của channel
+
+	// bảo vệ truy cập connection (được RabbitManager share cho nhiều Consumer)
+	mu   sync.RWMutex
+	conn *amqp.Connection
+}
+
+// ===== helper set/get connection an toàn =====
+func (c *Consumer) setConn(conn *amqp.Connection) {
+	c.mu.Lock()
+	c.conn = conn
+	c.mu.Unlock()
+}
+func (c *Consumer) getConn() *amqp.Connection {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.conn
+}
+
+// ---------------------------------------------------------------------------
+// run – vòng lặp FI x X tự giám sát channel
+// ---------------------------------------------------------------------------
+func (c *Consumer) run(ctx context.Context) {
+	base, max := 5*time.Second, time.Minute
+	backoff := time.Duration(0) // =0 để lần đầu không log lỗi
+
+	for {
+		// Chờ connection
+		conn := c.getConn()
+		if conn == nil || conn.IsClosed() {
+			select {
+			case <-time.After(base):
+				continue // chờ tiếp
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		// Đã có connection → thử mở channel
+		if err := c.openChannel(); err != nil {
+			if backoff == 0 { // lần đầu, ghi log dạng Debug thay vì Error
+				log.Printf("[%s] waiting for connection…", c.name)
+			} else {
+				log.Printf("[%s] openChannel error: %v", c.name, err)
+			}
+		} else {
+			backoff = base // reset sau khi thành công
+			// 2️⃣ chờ tới khi channel đóng hoặc context bị huỷ
+			select {
+			case <-ctx.Done():
+				c.closeChannel()
+				return
+			case err := <-c.notify: // channel NotifyClose
+				if err != nil {
+					log.Printf("[%s] channel closed: %v", c.name, err)
+				}
+			}
+		}
+
+		// 3️⃣ back‑off có jitter trước khi thử lại
+		jitter := time.Duration(rand.Int63n(int64(backoff)))
+		delay := backoff + jitter/2
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return
+		}
+
+		// 4️⃣ nhân đôi back‑off tới ngưỡng max
+		if backoff < max {
+			backoff *= 2
+			if backoff > max {
+				backoff = max
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// openChannel – mở channel mới, khai báo topology và khởi chạy consumeLoop
+// ---------------------------------------------------------------------------
+func (c *Consumer) openChannel() error {
+	conn := c.getConn()
+	if conn == nil || conn.IsClosed() {
+		return errors.New("connection not ready")
+	}
+
+	// mở channel
+	ch, err := conn.Channel()
 	if err != nil {
 		return err
 	}
-	// 1️⃣ Thiết lập prefetch (QoS) – ưu tiên giá trị riêng trong QueueConfig.
+
+	// cài đặt QoS (prefetch)
 	prefetch := c.cfg.Prefetch
-	if prefetch == 0 {
-		prefetch = m.cfg.RabbitMQ.Prefetch
-	}
 	if prefetch > 0 {
 		if err = ch.Qos(prefetch, 0, false); err != nil {
 			return err
 		}
 	}
-	// 2️⃣ Khai báo topology (queue/exchange) hoặc verify passive.
+
+	// khai báo queue + exchange (idempotent, nên gọi mỗi lần reconnect)
 	if err = declareTopology(ch, &c.cfg); err != nil {
 		return err
 	}
 
+	// cập nhật trạng thái
 	c.ch = ch
-	go c.consumeLoop(m.ctx) // Chạy goroutine nhận message.
+	c.notify = ch.NotifyClose(make(chan *amqp.Error, 1))
+
+	// chạy goroutine tiêu thụ message
+	go c.consumeLoop()
+
+	log.Printf("[%s] channel (re)started", c.name)
 	return nil
 }
 
-// ======================= Phần khai báo Queue / Exchange =======================
-
-// declareTopology đảm bảo queue/exchange tồn tại trước khi Consume.
-// Nếu q.Passive = true ➔ chỉ kiểm tra tồn tại, không tạo mới.
-func declareTopology(ch *amqp.Channel, q *QueueConfig) error {
-	if q.Passive {
-		_, err := ch.QueueDeclarePassive(q.Queue, q.Durable, q.AutoDelete, false, false, q.Arguments)
-		return err
+// closeChannel đóng channel hiện tại nếu có.
+func (c *Consumer) closeChannel() {
+	if c.ch != nil {
+		_ = c.ch.Close()
+		c.ch = nil
 	}
-	// Khai báo exchange (nếu cấu hình)
-	if q.Exchange != "" {
-		exType := "direct"
-		if q.BindingKey == "" {
-			exType = "fanout" // Nếu không có bindingKey → dùng fanout.
-		}
-		if err := ch.ExchangeDeclare(q.Exchange, exType, q.Durable, q.AutoDelete, false, false, nil); err != nil {
-			return err
-		}
-	}
-	// Khai báo queue
-	_, err := ch.QueueDeclare(q.Queue, q.Durable, q.AutoDelete, false, false, q.Arguments)
-	if err != nil {
-		return err
-	}
-	// Bind queue với exchange (nếu có)
-	if q.Exchange != "" {
-		if err = ch.QueueBind(q.Queue, q.BindingKey, q.Exchange, false, nil); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
-// ======================= Vòng lặp tiêu thụ message =======================
-
-func (c *Consumer) consumeLoop(ctx context.Context) {
-	// Khởi tạo luồng Consume. AutoAck quyết định driver tự ACK hay thủ công.
-	msgs, err := c.ch.Consume(c.cfg.Queue, c.cfg.ConsumerTag, c.cfg.AutoAck, false, false, false, nil)
+// ---------------------------------------------------------------------------
+// consumeLoop – đăng ký Consume và đọc message liên tục
+// ---------------------------------------------------------------------------
+func (c *Consumer) consumeLoop() {
+	msgs, err := c.ch.Consume(
+		c.cfg.Queue,       // queue
+		c.cfg.ConsumerTag, // consumer tag
+		c.cfg.AutoAck,     // auto‑ack?
+		false,             // exclusive
+		false, false, nil, // no‑local, no‑wait, args
+	)
 	if err != nil {
 		log.Printf("[%s] consume error: %v", c.name, err)
 		return
 	}
-	for {
-		select {
-		case <-ctx.Done():
-			_ = c.ch.Cancel(c.cfg.ConsumerTag, false)
-			return // Dừng graceful khi manager Stop()
-		case m, ok := <-msgs:
-			if !ok {
-				return // Channel bị đóng
-			}
-			c.handleDelivery(ctx, &m)
-		}
+	for m := range msgs { // vòng lặp vô hạn tới khi channel đóng
+		c.handleDelivery(&m)
 	}
 }
 
-// handleDelivery gọi business handler, quản lý ACK/NACK & reply (RPC pattern).
-func (c *Consumer) handleDelivery(ctx context.Context, m *amqp.Delivery) {
+// ---------------------------------------------------------------------------
+// handleDelivery – gọi business handler, trả lời RPC (nếu có) & ack/nack
+// ---------------------------------------------------------------------------
+func (c *Consumer) handleDelivery(m *amqp.Delivery) {
+	// chặn panic để không giết goroutine
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[%s] panic: %v", c.name, r)
@@ -301,7 +470,7 @@ func (c *Consumer) handleDelivery(ctx context.Context, m *amqp.Delivery) {
 		}
 	}()
 
-	// Gọi hàm xử lý từ user (HandlerFunc).
+	// gọi hàm xử lý chính
 	resp, err := c.handler(m.Body)
 	if err != nil {
 		log.Printf("[%s] handler error: %v", c.name, err)
@@ -309,40 +478,88 @@ func (c *Consumer) handleDelivery(ctx context.Context, m *amqp.Delivery) {
 		return
 	}
 
+	// nếu đây là RPC request (ReplyTo != ""), publish trả lời
 	if m.ReplyTo != "" && resp != nil {
-		replyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		publishCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if publishErr := c.ch.PublishWithContext(replyCtx, "", m.ReplyTo, false, false, amqp.Publishing{
-			CorrelationId: m.CorrelationId,
-			ContentType:   "application/json",
-			Body:          resp,
-		}); publishErr != nil {
-			log.Printf("[%s] reply publish error: %v", c.name, publishErr)
-			_ = m.Nack(false, true) // NACK & requeue để retry gửi reply
+		if err := c.ch.PublishWithContext(publishCtx,
+			"", m.ReplyTo, false, false,
+			amqp.Publishing{
+				CorrelationId: m.CorrelationId,
+				ContentType:   "application/json",
+				Body:          resp,
+			}); err != nil {
+			log.Printf("[%s] reply publish error: %v", c.name, err)
+			_ = m.Nack(false, true) // requeue để thử lại
 			return
 		}
 	}
 
-	// Thủ công ACK khi xử lý thành công (nếu AutoAck = false).
+	// cuối cùng, ack nếu không AutoAck
 	if !c.cfg.AutoAck {
 		_ = m.Ack(false)
 	}
 }
 
-// ======================= Helper tải cấu hình TLS =======================
+// ============================================================================
+// 🛠️ Helper: khai báo topology (exchange / queue / binding) idempotent
+// ============================================================================
+func declareTopology(ch *amqp.Channel, q *QueueConfig) error {
+	if q.Passive {
+		_, err := ch.QueueDeclarePassive(
+			q.Queue, q.Durable, q.AutoDelete, false, false, q.Arguments,
+		)
+		return err
+	}
 
-// loadTLSConfig đọc chứng chỉ client + CA, trả về *tls.Config đủ dùng cho DialTLS.
+	// 1. Exchange (nếu có)
+	if q.Exchange != "" {
+		exType := "direct"
+		if q.BindingKey == "" { // không có routing key ⇒ fanout
+			exType = "fanout"
+		}
+		if err := ch.ExchangeDeclare(
+			q.Exchange, exType, q.Durable, q.AutoDelete,
+			false, false, nil,
+		); err != nil {
+			return err
+		}
+	}
+
+	// 2. Queue
+	if _, err := ch.QueueDeclare(
+		q.Queue, q.Durable, q.AutoDelete, false, false, q.Arguments,
+	); err != nil {
+		return err
+	}
+
+	// 3. Bind queue ↔ exchange (nếu có)
+	if q.Exchange != "" {
+		if err := ch.QueueBind(
+			q.Queue, q.BindingKey, q.Exchange, false, nil,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ============================================================================
+// 🔐 Helper: loadTLSConfig – đọc file PEM & tạo *tls.Config
+// ============================================================================
 func loadTLSConfig(cfg *RabbitMQConfig) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(cfg.ClientCert, cfg.ClientKey)
 	if err != nil {
 		return nil, err
 	}
+
 	caPem, err := os.ReadFile(cfg.CACert)
 	if err != nil {
 		return nil, err
 	}
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(caPem)
+
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      pool,

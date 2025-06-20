@@ -1,6 +1,22 @@
 rabbitmq:
-  url: "amqp://guest:guest@localhost:5672/"
-  heartbeat: 10s
+  url: amqp://guest:guest@localhost:5672/
+  tls: false                # bật TLS (true) nếu dùng DialTLS
+  prefetch: 10              # QoS chung, từng consumer có thể override
+  reconnectDelay: 5s        # back‑off khởi đầu
   queues:
-    EmailHandler:
-      queue: xhkzeroone.EmailHandler
+    loghandler:
+      queue: log-queue
+      exchange: logs
+      durable: true
+    log2handler:
+      queue: log2-queue
+      exchange: logs
+      durable: true
+    emailhandler:
+      queue: email-queue
+      exchange: email
+      durable: true
+    onboardhandler:
+      queue: onboard-queue
+      exchange: onboard
+      durable: true
