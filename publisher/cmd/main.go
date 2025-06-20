@@ -23,14 +23,14 @@ func main() {
 
 	// 📨 Gửi tin nhắn và chờ phản hồi
 	body := []byte(`{"message": "Hello from Publisher!"}`)
-	reply, err := pub.Publish(ctx, "xhkzeroone.EmailHandler", body, true)
+	reply, err := pub.Publish(ctx, "email-queue", body, true)
 	if err != nil {
 		log.Fatalf("Failed to publish: %v", err)
 	}
 	fmt.Println("📬 Reply received:", string(reply))
 
 	// Chỉ gửi mà không cần nhận lại
-	_, err = pub.Publish(ctx, "xhkzeroone.EmailHandler", []byte(`{"event": "fire-and-forget"}`), false)
+	_, err = pub.Publish(ctx, "email-queue", []byte(`{"event": "fire-and-forget"}`), false)
 	if err != nil {
 		log.Fatalf("Failed to publish fire-and-forget: %v", err)
 	}
