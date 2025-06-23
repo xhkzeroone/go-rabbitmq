@@ -1,8 +1,9 @@
 package consumer
 
 import (
-	amqp "github.com/rabbitmq/amqp091-go"
 	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 // === Configuration ===
@@ -24,15 +25,17 @@ type RabbitMQConfig struct {
 }
 
 type QueueConfig struct {
-	Queue         string     `yaml:"queue" mapstructure:"queue" json:"queue"`
-	BindingKey    string     `yaml:"bindingKey" mapstructure:"bindingKey" json:"bindingKey"`
-	Exchange      string     `yaml:"exchange" mapstructure:"exchange" json:"exchange"`
-	ConsumerTag   string     `yaml:"consumerTag" mapstructure:"consumerTag" json:"consumerTag"`
-	AutoAck       bool       `yaml:"autoAck" mapstructure:"autoAck" json:"autoAck"`
-	Durable       bool       `yaml:"durable" mapstructure:"durable" json:"durable"`
-	AutoDelete    bool       `yaml:"autoDelete" mapstructure:"autoDelete" json:"autoDelete"`
-	Passive       bool       `yaml:"passive" mapstructure:"passive" json:"passive"`
-	Prefetch      int        `yaml:"prefetch" mapstructure:"prefetch" json:"prefetch"`
-	Arguments     amqp.Table `yaml:"arguments" mapstructure:"arguments" json:"arguments"`
-	RequeueOnFail bool       `yaml:"requeueOnFail" mapstructure:"requeueOnFail" json:"requeueOnFail"`
+	Queue         string        `yaml:"queue" mapstructure:"queue" json:"queue"`
+	BindingKey    string        `yaml:"bindingKey" mapstructure:"bindingKey" json:"bindingKey"`
+	Exchange      string        `yaml:"exchange" mapstructure:"exchange" json:"exchange"`
+	ExchangeType  string        `yaml:"exchangeType" mapstructure:"exchangeType" json:"exchangeType"`
+	ConsumerTag   string        `yaml:"consumerTag" mapstructure:"consumerTag" json:"consumerTag"`
+	AutoAck       bool          `yaml:"autoAck" mapstructure:"autoAck" json:"autoAck"`
+	Durable       bool          `yaml:"durable" mapstructure:"durable" json:"durable"`
+	AutoDelete    bool          `yaml:"autoDelete" mapstructure:"autoDelete" json:"autoDelete"`
+	Passive       bool          `yaml:"passive" mapstructure:"passive" json:"passive"`
+	Prefetch      int           `yaml:"prefetch" mapstructure:"prefetch" json:"prefetch"`
+	Arguments     amqp.Table    `yaml:"arguments" mapstructure:"arguments" json:"arguments"`
+	RequeueOnFail bool          `yaml:"requeueOnFail" mapstructure:"requeueOnFail" json:"requeueOnFail"`
+	RPCTimeout    time.Duration `yaml:"rpcTimeout" mapstructure:"rpcTimeout" json:"rpcTimeout"`
 }

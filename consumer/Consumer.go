@@ -12,7 +12,7 @@
 //     kết nối bị mất; việc reconnect được thực hiện với chiến lược back‑off
 //     có jitter để tránh bão reconnect.
 //  4. Toàn bộ mã nguồn được bình luận chi tiết bằng tiếng Việt và tuân thủ
-//     quy tắc "Go doc":
+//     quy tắc "Go doc":
 //     • Mọi tên xuất (exported) đều có chú thích bắt đầu bằng chính tên đó.
 //     • Tên private quan trọng cũng có chú thích ngắn gọn khi cần.
 //
@@ -36,12 +36,13 @@ import (
 	"crypto/x509"
 	"errors"
 
-	amqp "github.com/rabbitmq/amqp091-go"
 	"log"
 	"math/rand"
 	"os"
 	"sync"
 	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 /*  --------------------------------------------------------------------------
@@ -94,7 +95,7 @@ import (
 // Hàm Handle nhận *payload* dưới dạng []byte, trả về []byte (có thể nil) làm
 // response RPC cùng error (nếu có).
 //
-// Comment này dùng làm ví dụ cho builder *go doc* – trong dự án thật, Handler
+// Comment này dùng làm ví dụ cho builder *go doc* – trong dự án thật, Handler
 // thường đã được định nghĩa ở package khác.
 //
 //go:generate mockgen -destination=mocks_test.go -package=consumer . Handler
@@ -108,6 +109,26 @@ import (
 // ============================================================================
 // 🌐 STRUCT RabbitManager – quản trị **connection** chia sẻ cho nhiều Consumer
 // ============================================================================
+
+// Logger interface cho phép inject logger custom (vd: slog, zap, logrus)
+type Logger interface {
+	Infof(format string, args ...interface{})
+	Errorf(format string, args ...interface{})
+	Debugf(format string, args ...interface{})
+}
+
+// logger mặc định dùng log.Printf
+type stdLogger struct{}
+
+func (l *stdLogger) Infof(format string, args ...interface{}) {
+	log.Printf("[INFO] "+format, args...)
+}
+func (l *stdLogger) Errorf(format string, args ...interface{}) {
+	log.Printf("[ERROR] "+format, args...)
+}
+func (l *stdLogger) Debugf(format string, args ...interface{}) {
+	log.Printf("[DEBUG] "+format, args...)
+}
 
 // RabbitManager giữ một kết nối duy nhất tới RabbitMQ và phân phát kết nối đó
 // cho nhiều Consumer dưới dạng các channel. Nó giám sát connection gốc và tự
@@ -139,15 +160,25 @@ type RabbitManager struct {
 
 	ctx    context.Context // context gốc (huỷ để stop)
 	cancel context.CancelFunc
+
+	wg     sync.WaitGroup // đợi các consumer dừng
+	logger Logger         // logger custom
 }
 
 // New tạo mới một RabbitManager với cấu hình cfg nhưng CHƯA mở kết nối tới
 // RabbitMQ. Hàm trả về con trỏ quản lý – việc kết nối sẽ được thực hiện trong
 // phương thức Listen.
-func New(cfg *Config) *RabbitManager {
+func New(cfg *Config, logger ...Logger) *RabbitManager {
+	var l Logger
+	if len(logger) > 0 && logger[0] != nil {
+		l = logger[0]
+	} else {
+		l = &stdLogger{}
+	}
 	return &RabbitManager{
 		cfg:      cfg,
 		handlers: make(map[string]HandlerFunc),
+		logger:   l,
 	}
 }
 
@@ -175,7 +206,7 @@ func (m *RabbitManager) Listen(ctx context.Context) error {
 
 	// 1) Thử kết nối một lần ngay đầu
 	if err := m.connect(); err != nil {
-		log.Printf("[RabbitMQ] initial dial failed: %v (will retry in loop)", err)
+		m.logger.Errorf("[RabbitMQ] initial dial failed: %v (will retry in loop)", err)
 	}
 
 	// 2) Tạo & chạy consumer SAU khi (đã hoặc sẽ) có connection
@@ -184,11 +215,11 @@ func (m *RabbitManager) Listen(ctx context.Context) error {
 		if !ok { // không có handler tương ứng
 			continue
 		}
-		c := &Consumer{cfg: qc, name: key, handler: hd}
-		// gán conn hiện tại (có thể nil); sau này connectionLoop sẽ update
+		c := &Consumer{cfg: qc, name: key, handler: hd, logger: m.logger}
 		c.setConn(m.conn)
 		m.consumers = append(m.consumers, c)
-		go c.run(m.ctx) // mỗi consumer tự giám sát channel
+		m.wg.Add(1)
+		go c.run(m.ctx, &m.wg) // truyền WaitGroup
 	}
 	if len(m.consumers) == 0 {
 		return errors.New("no consumers to start")
@@ -213,22 +244,19 @@ func (m *RabbitManager) connectionLoop() error {
 	for {
 		// thử kết nối
 		if err := m.connect(); err != nil {
-			log.Printf("[RabbitMQ] dial error: %v", err)
+			m.logger.Errorf("[RabbitMQ] dial error: %v", err)
 		} else {
-			log.Printf("[RabbitMQ] connection established (%d consumers)", len(m.consumers))
-			// chờ tới khi có sự cố
+			m.logger.Infof("[RabbitMQ] connection established (%d consumers)", len(m.consumers))
 			connClosed := make(chan *amqp.Error, 1)
 			m.conn.NotifyClose(connClosed)
 			select {
-			case <-m.ctx.Done(): // ứng dụng dừng
+			case <-m.ctx.Done():
 				m.closeConn()
 				return nil
-			case err := <-connClosed: // connection bị drop
-				log.Printf("[RabbitMQ] connection closed: %v", err)
+			case err := <-connClosed:
+				m.logger.Errorf("[RabbitMQ] connection closed: %v", err)
 			}
 		}
-
-		// exponential back‑off
 		jitter := time.Duration(rand.Int63n(int64(backoff)))
 		delay := backoff + jitter/2
 		select {
@@ -295,11 +323,38 @@ func (m *RabbitManager) Stop() {
 	if m.cancel != nil {
 		m.cancel()
 	}
+	m.wg.Wait() // đợi các consumer dừng
 }
 
 // ============================================================================
 // 🧩 STRUCT Consumer – 1 consumer tương ứng 1 queue + handler
 // ============================================================================
+
+// Trạng thái consumer
+
+type ConsumerStatus int
+
+const (
+	ConsumerStopped ConsumerStatus = iota
+	ConsumerWaiting
+	ConsumerRunning
+	ConsumerError
+)
+
+func (s ConsumerStatus) String() string {
+	switch s {
+	case ConsumerStopped:
+		return "stopped"
+	case ConsumerWaiting:
+		return "waiting"
+	case ConsumerRunning:
+		return "running"
+	case ConsumerError:
+		return "error"
+	default:
+		return "unknown"
+	}
+}
 
 // Consumer đại diện cho một worker tiêu thụ một hàng đợi cụ thể. Mỗi Consumer
 // có channel AMQP riêng (multiplexed trong cùng connection) và tự động khôi
@@ -318,6 +373,10 @@ type Consumer struct {
 	// bảo vệ truy cập connection (được RabbitManager share cho nhiều Consumer)
 	mu   sync.RWMutex
 	conn *amqp.Connection
+
+	status   ConsumerStatus
+	statusMu sync.RWMutex
+	logger   Logger
 }
 
 // ===== helper set/get connection an toàn =====
@@ -335,53 +394,52 @@ func (c *Consumer) getConn() *amqp.Connection {
 // ---------------------------------------------------------------------------
 // run – vòng lặp FI x X tự giám sát channel
 // ---------------------------------------------------------------------------
-func (c *Consumer) run(ctx context.Context) {
+func (c *Consumer) run(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
 	base, max := 5*time.Second, time.Minute
-	backoff := time.Duration(0) // =0 để lần đầu không log lỗi
-
+	backoff := time.Duration(0)
 	for {
-		// Chờ connection
+		c.setStatus(ConsumerWaiting)
 		conn := c.getConn()
 		if conn == nil || conn.IsClosed() {
 			select {
 			case <-time.After(base):
-				continue // chờ tiếp
+				continue
 			case <-ctx.Done():
+				c.setStatus(ConsumerStopped)
 				return
 			}
 		}
-
-		// Đã có connection → thử mở channel
 		if err := c.openChannel(); err != nil {
-			if backoff == 0 { // lần đầu, ghi log dạng Debug thay vì Error
-				log.Printf("[%s] waiting for connection…", c.name)
+			if backoff == 0 {
+				c.logger.Debugf("[%s] waiting for connection…", c.name)
 			} else {
-				log.Printf("[%s] openChannel error: %v", c.name, err)
+				c.logger.Errorf("[%s] openChannel error: %v", c.name, err)
 			}
+			c.setStatus(ConsumerError)
 		} else {
-			backoff = base // reset sau khi thành công
-			// 2️⃣ chờ tới khi channel đóng hoặc context bị huỷ
+			backoff = base
+			c.setStatus(ConsumerRunning)
 			select {
 			case <-ctx.Done():
 				c.closeChannel()
+				c.setStatus(ConsumerStopped)
 				return
-			case err := <-c.notify: // channel NotifyClose
+			case err := <-c.notify:
 				if err != nil {
-					log.Printf("[%s] channel closed: %v", c.name, err)
+					c.logger.Errorf("[%s] channel closed: %v", c.name, err)
 				}
+				c.setStatus(ConsumerError)
 			}
 		}
-
-		// 3️⃣ back‑off có jitter trước khi thử lại
 		jitter := time.Duration(rand.Int63n(int64(backoff)))
 		delay := backoff + jitter/2
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
+			c.setStatus(ConsumerStopped)
 			return
 		}
-
-		// 4️⃣ nhân đôi back‑off tới ngưỡng max
 		if backoff < max {
 			backoff *= 2
 			if backoff > max {
@@ -425,8 +483,7 @@ func (c *Consumer) openChannel() error {
 
 	// chạy goroutine tiêu thụ message
 	go c.consumeLoop()
-
-	log.Printf("[%s] channel (re)started", c.name)
+	c.logger.Infof("[%s] channel (re)started", c.name)
 	return nil
 }
 
@@ -443,14 +500,14 @@ func (c *Consumer) closeChannel() {
 // ---------------------------------------------------------------------------
 func (c *Consumer) consumeLoop() {
 	msgs, err := c.ch.Consume(
-		c.cfg.Queue,       // queue
-		c.cfg.ConsumerTag, // consumer tag
-		c.cfg.AutoAck,     // auto‑ack?
-		false,             // exclusive
-		false, false, nil, // no‑local, no‑wait, args
+		c.cfg.Queue,
+		c.cfg.ConsumerTag,
+		c.cfg.AutoAck,
+		false,
+		false, false, nil,
 	)
 	if err != nil {
-		log.Printf("[%s] consume error: %v", c.name, err)
+		c.logger.Errorf("[%s] consume error: %v", c.name, err)
 		return
 	}
 	for m := range msgs { // vòng lặp vô hạn tới khi channel đóng
@@ -462,43 +519,50 @@ func (c *Consumer) consumeLoop() {
 // handleDelivery – gọi business handler, trả lời RPC (nếu có) & ack/nack
 // ---------------------------------------------------------------------------
 func (c *Consumer) handleDelivery(m *amqp.Delivery) {
-	// chặn panic để không giết goroutine
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[%s] panic: %v", c.name, r)
+			c.logger.Errorf("[%s] panic: %v", c.name, r)
 			_ = m.Nack(false, c.cfg.RequeueOnFail)
 		}
 	}()
-
-	// gọi hàm xử lý chính
+	if c.handler == nil {
+		c.logger.Errorf("[%s] handler is nil, message dropped", c.name)
+		_ = m.Nack(false, c.cfg.RequeueOnFail)
+		return
+	}
 	resp, err := c.handler(m.Body)
 	if err != nil {
-		log.Printf("[%s] handler error: %v", c.name, err)
+		c.logger.Errorf("[%s] handler error: %v", c.name, err)
 		_ = m.Nack(false, c.cfg.RequeueOnFail)
 		return
 	}
 
 	// nếu đây là RPC request (ReplyTo != ""), publish trả lời
 	if m.ReplyTo != "" && resp != nil {
-		publishCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		timeout := 5 * time.Second // Giá trị mặc định
+		if c.cfg.RPCTimeout > 0 {
+			timeout = c.cfg.RPCTimeout
+		}
+		publishCtx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		if err := c.ch.PublishWithContext(publishCtx,
-			"", m.ReplyTo, false, false,
-			amqp.Publishing{
-				CorrelationId: m.CorrelationId,
-				ContentType:   "application/json",
-				Body:          resp,
-			}); err != nil {
-			log.Printf("[%s] reply publish error: %v", c.name, err)
-			_ = m.Nack(false, true) // requeue để thử lại
-			return
+		if err := c.ch.PublishWithContext(publishCtx, "", m.ReplyTo, false, false, amqp.Publishing{CorrelationId: m.CorrelationId, ContentType: "application/json", Body: resp}); err != nil {
+			c.logger.Errorf("[%s] reply publish error: %v", c.name, err)
 		}
 	}
-
-	// cuối cùng, ack nếu không AutoAck
 	if !c.cfg.AutoAck {
 		_ = m.Ack(false)
 	}
+}
+
+func (c *Consumer) setStatus(s ConsumerStatus) {
+	c.statusMu.Lock()
+	defer c.statusMu.Unlock()
+	c.status = s
+}
+func (c *Consumer) GetStatus() ConsumerStatus {
+	c.statusMu.RLock()
+	defer c.statusMu.RUnlock()
+	return c.status
 }
 
 // ============================================================================
